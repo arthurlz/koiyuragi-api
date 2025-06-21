@@ -2,12 +2,14 @@
 export const runtime = 'nodejs';            // 需要 Sharp & Tesseract，放 Node λ
 
 import { NextResponse, NextRequest } from 'next/server';
-import sharp from 'sharp';
 import { join } from 'path';
-import Tesseract from 'tesseract.js';
-import { Message, streamObject } from 'ai';
+import fs from 'fs'
+import { generateText, Message, streamObject } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import { z } from 'zod';
+import { supabase } from '@/app/lib/supabase';
+import { createFileSha256 } from '@/app/lib/files';
+
 
 /* 1) GPT 输出结构 */
 const Reply = z.object({
@@ -44,14 +46,8 @@ const fewShots: Omit<Message, 'id'>[] = [
   }
 ];
 
-const worker = await Tesseract.createWorker('jpn+eng');
 
-// , 1, {
-//   workerPath: join(process.cwd(),'node_modules/tesseract.js/dist/worker.min.js'),
-//   langPath:  join(process.cwd(),'node_modules/tesseract.js-core/tessdata'),
-//   corePath:  join(process.cwd(),'node_modules/tesseract.js-core/tesseract-core.wasm.gz'),
-//   cacheMethod:'none'
-// }
+const bucketName = 'documents'
 
 /* 2) API 入口 */
 export async function POST(req: NextRequest) {
@@ -62,20 +58,101 @@ export async function POST(req: NextRequest) {
   if (!file) {
     return NextResponse.json({ error: 'no file' }, { status: 400 });
   }
+  const fileName = await createFileSha256(file)
+  const { data, error: errorGet } = await supabase
+  .storage
+  .getBucket(bucketName)
+  if (errorGet?.status === 404) {
+    const { data: dataCreate, error } = await supabase
+    .storage
+    .createBucket(bucketName, {
+      public: false,
+      // allowedMimeTypes: ['image/png'],
+      // fileSizeLimit: 1024
+    })
+    console.log('bucket: ', dataCreate, error)
+  }
+  
+  const filePath = `uploads/${fileName}`
+  const { data: items, error: listError } = await supabase
+    .storage
+    .from(bucketName)
+    .list('uploads/', { search: fileName });
+  console.log('list: ,', items)
+  if (listError) {
+    console.error('列举目录失败：', listError);
+  } else if (items.some(item => item.name === fileName)) {
+    // 找到同名
+    console.log('文件已存在，不再上传：', filePath);
+  } else {
+    // 2) 真正上传
+    const { data: uploadData, error } = await supabase
+    .storage
+    .from(bucketName)
+    .upload(filePath, file);
+    if (error) {
+      if (error.message.includes('cannot overwrite existing file')) {
+        // 已经存在
+        console.log('文件已存在，不再上传：', filePath);
+        // 你可以 return 已有 public URL，或返回特定状态码
+      } else {
+        // 其他错误
+        console.error('上传失败：', error);
+        throw error;
+      }
+    }
+  }
+  
+  // const publicUrl = supabase
+  //   .storage
+  //   .from(bucketName)
+  //   .getPublicUrl(filePath)
+  //   .data.publicUrl;
+  const signedData = await supabase
+  .storage
+  .from(bucketName)
+  .createSignedUrl(filePath, 10);
+  if (!signedData.data?.signedUrl) {
+    throw new Error('can not create signed url');
+  }
+	const { text: cleanText } = await generateText({
+		model: openai('gpt-4o'),
+		// prompt: ``,
+		system: 'あなたは画像内のチャットスクリーンショットから、発言者ごとに区切って会話内容をテキスト化するプロフェッショナルなOCRアシスタントです。',
+    messages: [
+      {
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: `以下の画像に含まれるチャットメッセージを、発言者ごとに区切って、
+            送信順に1行ずつテキストとして抽出してください。
+            
+            例：
+            ユーザー: こんにちは！
+            AI: ご相談内容を教えてください。
+            
+            ――――――――――――――――――
+            【ここに画像を添付】`
+        },
+          {
+          type: 'image',
+          image: signedData.data?.signedUrl
+        }]
+      }
+    ]
+    // messages: [
+    //   {
+    //     role: 'user',
+    //     content: [
+    //       {
+    //         type: 'image',
+    //         image: fs.readFileSync(file).toString('base64'),
+    //       },
+    //     ],
+    //   },
+    // ],
+	});
 
-  /* 2-2 将 File 转 Buffer */
-  const inputBuf = Buffer.from(await file.arrayBuffer());
-
-  /* 2-3 预处理：缩小宽度到 1080px + 灰度 */
-  const preBuf = await sharp(inputBuf)
-    .resize({ width: 1080 })
-    .grayscale()
-    .toBuffer();
-
-  /* 2-4 OCR：小量图片本地跑 tesseract.js 即可 */
-  const { data: { text } } = await worker.recognize(preBuf);
-  console.log(text);
-  /* 2-5 GPT-4o 三段式分析（streamObject 带增量、结构校验） */
   const stream = await streamObject({
     model: openai('gpt-4o'),
     schema: Reply,
@@ -89,7 +166,7 @@ export async function POST(req: NextRequest) {
       ...fewShots,
       {
         role: 'user',
-        content: `以下はチャットの文字起こしです：\n${text}\n\n相手の行動を分析し、励ましとアドバイスをください。`
+        content: `以下はチャットの文字起こしです：\n${cleanText}\n\n相手の行動を分析し、励ましとアドバイスをください。`
       }
     ]
   });
@@ -97,11 +174,10 @@ export async function POST(req: NextRequest) {
 
   /* 2-6 把 ReadableStream 原样返回，前端边到边渲染 */
   // return new Response(stream, { headers:{ 'Content-Type':'text/event-stream' }});
-  let full: string | null = null;   
+  let full = null;   
   for await (const chunk of stream.partialObjectStream) {
     // 每个 chunk 都是 “最新合并后的对象”
-    // console.log(chunk);
-    full = JSON.stringify(chunk);
+    full = chunk;
   }
 
   return NextResponse.json(full);

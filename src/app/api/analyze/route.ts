@@ -1,184 +1,223 @@
-// src/app/api/analyze/route.ts
-export const runtime = 'nodejs';            // 需要 Sharp & Tesseract，放 Node λ
-
-import { NextResponse, NextRequest } from 'next/server';
-import { join } from 'path';
-import fs from 'fs'
-import { generateText, Message, streamObject } from 'ai';
+export const runtime = 'nodejs';
+import { NextRequest } from 'next/server';
+import { generateText, Message, streamObject, streamText } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import { z } from 'zod';
-import { supabase } from '@/app/lib/supabase';
-import { createFileSha256 } from '@/app/lib/files';
-
+import { uploadWithDedup } from '@/app/lib/files';
+import { CHAT_PROMPT, ANALYSIS_PROMPT, fewShots } from './prompt';
+import { createAuthDb } from '@/app/lib/supabase';
+import { saveChat } from '@/app/lib/supabase/analyze';
+import { loadChatByClientId } from '@/app/lib/supabase/loadChat';
+import { getType } from '@/app/lib/utils';
 
 /* 1) GPT 输出结构 */
 const Reply = z.object({
   empathy: z.string(),
   analysis: z.string(),
-  suggestion: z.object({
-    strategy: z.enum(['保持距离', '等待时机', '主动沟通']),
-    message: z.string()
-  })
+  suggestion: z.string()
 });
 
-const fewShots: Omit<Message, 'id'>[] = [
-  {
-    role: 'assistant',
-    content: JSON.stringify({
-      empathy: "既読スルーが続くと、胸がソワソワしますよね🌸",
-      analysis: "・相手が忙しく返信のタイミングを探している可能性\n・メッセージ内容を熟考している途中かもしれません",
-      suggestion: {
-        strategy: "待機タイミング",
-        message: "お疲れさま！無理しないでね😊"
-      }
-    })
-  },
-  {
-    role: 'assistant',
-    content: JSON.stringify({
-      empathy: "短い返事ばかりだと、距離を感じてしまいますよね✨",
-      analysis: "・疲れていて深い返信が難しい\n・会話のテーマが相手に合っていない可能性",
-      suggestion: {
-        strategy: "率直に伝える",
-        message: "最近どう？何か楽しいことあった？😌"
-      }
-    })
-  }
-];
-
-
-const bucketName = 'documents'
+const hasImageAttachment = (m: Message) =>
+  m.experimental_attachments?.some(a => a.contentType?.startsWith('image/'));
 
 /* 2) API 入口 */
 export async function POST(req: NextRequest) {
-  /* 2-1 解析 multipart (仅需一行) */
-  const form = await req.formData();
-  const file = form.get('file') as File;
+  const auth = req.headers.get('authorization');
+  const token = auth?.replace(/^Bearer /, '');
+  console.log('token: ', token)
+  const supabase = createAuthDb(token ?? '')
+  const { data: userData } = await supabase.auth.getUser(token);
+  // console.log(userData)
+  const data = await req.json();
+  console.log(data)
+  const { id, message, data: extra }: { id: string, message: Message; data?: any } = data;
+  const userMsg = message.role === 'user';
+  if (!userMsg) return new Response('no user message', { status: 400 });
 
-  if (!file) {
-    return NextResponse.json({ error: 'no file' }, { status: 400 });
+  /* ---- 4.2 判断是否需要三段式分析 ---- */
+  const wantsAnalysis =
+    hasImageAttachment(message) ||
+    extra?.mode === 'analyze' ||
+    message.content.toString().trim().startsWith('#分析') ||
+    message.content.toString().trim().startsWith('#analyze');
+
+  if (!userData.user?.id) {
+    return new Response('no user', { status: 401 });
   }
-  const fileName = await createFileSha256(file)
-  const { data, error: errorGet } = await supabase
-  .storage
-  .getBucket(bucketName)
-  if (errorGet?.status === 404) {
-    const { data: dataCreate, error } = await supabase
-    .storage
-    .createBucket(bucketName, {
-      public: false,
-      // allowedMimeTypes: ['image/png'],
-      // fileSizeLimit: 1024
+  let previousMessages: Array<{
+    role: 'user' | 'assistant' | 'system' | 'data',
+    content: string,
+  }> | undefined = undefined
+  try {
+    const previousChat = await loadChatByClientId(supabase, userData.user.id, id)
+    previousMessages = previousChat?.messages.map(msg => {
+      if (msg.role === 'assistant') {
+        const parsedContent = JSON.parse(msg.content)
+        console.log(msg.content)
+        if (getType(parsedContent) === 'Array') {
+          return {
+            id: msg.id,
+            role: msg.role,
+            content: parsedContent?.[0].text
+          }
+        } else if (getType(parsedContent) === 'Object') {
+          return {
+            id: msg.id,
+            role: msg.role,
+            content: parsedContent
+          }
+        }
+      }
+      return {
+        id: msg.id,
+        role: msg.role,
+        content: msg.content
+      }
     })
-    console.log('bucket: ', dataCreate, error)
+    console.log('previousMessages: ', previousMessages)
+  } catch(err) {
+    console.log(err)
   }
-  
-  const filePath = `uploads/${fileName}`
-  const { data: items, error: listError } = await supabase
-    .storage
-    .from(bucketName)
-    .list('uploads/', { search: fileName });
-  console.log('list: ,', items)
-  if (listError) {
-    console.error('列举目录失败：', listError);
-  } else if (items.some(item => item.name === fileName)) {
-    // 找到同名
-    console.log('文件已存在，不再上传：', filePath);
-  } else {
-    // 2) 真正上传
-    const { data: uploadData, error } = await supabase
-    .storage
-    .from(bucketName)
-    .upload(filePath, file);
-    if (error) {
-      if (error.message.includes('cannot overwrite existing file')) {
-        // 已经存在
-        console.log('文件已存在，不再上传：', filePath);
-        // 你可以 return 已有 public URL，或返回特定状态码
-      } else {
-        // 其他错误
-        console.error('上传失败：', error);
-        throw error;
+
+  if (wantsAnalysis) {
+    let chatText = '';
+    let imagePath = '';
+
+    /* 5.1 有截图则 OCR，没有则用原文字 */
+    if (hasImageAttachment(message)) {
+      const img = message.experimental_attachments!.find(a => a.contentType!.startsWith('image/'))!;
+      const { path, url } = await uploadWithDedup(img.url);
+      const { text } = await generateText({
+        model: openai('gpt-4o'),
+        system: 'あなたは画像内のチャットスクリーンショットから、発言者ごとに区切って会話内容をテキスト化するプロフェッショナルなOCRアシスタントです。',
+        messages: [
+          {
+            role: 'user',
+            content: [{
+              type: 'text',
+              text: `以下の画像に含まれるチャットメッセージを、発言者ごとに区切って、
+                送信順に1行ずつテキストとして抽出してください。
+                
+                例：
+                ユーザー: こんにちは！
+                AI: ご相談内容を教えてください。
+                
+                ――――――――――――――――――
+                【ここに画像を添付】`
+            },
+              {
+              type: 'image',
+              image: url
+            }]
+          }
+        ]
+      });
+
+      imagePath = path
+      chatText = text.trim()
+    } else {
+      chatText = typeof message.content === 'string'
+        ? message.content.trim().replace(/^#(分析|analyze)\s*/i, '') // 去掉指令前缀
+        : (message.content as any)[0]?.text ?? '';
+    }
+
+    const currentUserImageMessage = {
+      role: 'user' as 'user' | 'assistant' | 'system' | 'data',
+      content: {
+        type: 'image',
+        text: imagePath
       }
     }
-  }
-  
-  // const publicUrl = supabase
-  //   .storage
-  //   .from(bucketName)
-  //   .getPublicUrl(filePath)
-  //   .data.publicUrl;
-  const signedData = await supabase
-  .storage
-  .from(bucketName)
-  .createSignedUrl(filePath, 10);
-  if (!signedData.data?.signedUrl) {
-    throw new Error('can not create signed url');
-  }
-	const { text: cleanText } = await generateText({
-		model: openai('gpt-4o'),
-		// prompt: ``,
-		system: 'あなたは画像内のチャットスクリーンショットから、発言者ごとに区切って会話内容をテキスト化するプロフェッショナルなOCRアシスタントです。',
-    messages: [
-      {
-        role: 'user',
-        content: [{
-          type: 'text',
-          text: `以下の画像に含まれるチャットメッセージを、発言者ごとに区切って、
-            送信順に1行ずつテキストとして抽出してください。
-            
-            例：
-            ユーザー: こんにちは！
-            AI: ご相談内容を教えてください。
-            
-            ――――――――――――――――――
-            【ここに画像を添付】`
-        },
-          {
-          type: 'image',
-          image: signedData.data?.signedUrl
-        }]
-      }
-    ]
-    // messages: [
-    //   {
-    //     role: 'user',
-    //     content: [
-    //       {
-    //         type: 'image',
-    //         image: fs.readFileSync(file).toString('base64'),
-    //       },
-    //     ],
-    //   },
-    // ],
-	});
+    const pureText =
+    typeof message.content === 'string'
+      ? message.content
+      : (message.content as any)[0]?.text ?? '';
+    
+    const currentUserMessage = {
+      role: 'user' as 'user' | 'assistant' | 'system' | 'data',
+      content: pureText as string
+    }
 
-  const stream = await streamObject({
-    model: openai('gpt-4o'),
-    schema: Reply,
-    temperature: 0.7,
-    messages: [
-      {
-        role: 'system',
-        content:
-          'あなたは《恋ゆらぎ》アプリの “癒やし系 AI カウンセラー” です。，请阅读用户上传的聊天文字，并输出 JSON：{ empathy, analysis, suggestion }'
-      },
-      ...fewShots,
-      {
-        role: 'user',
-        content: `以下はチャットの文字起こしです：\n${cleanText}\n\n相手の行動を分析し、励ましとアドバイスをください。`
+    const currentMessages = [currentUserImageMessage, currentUserMessage]
+
+    console.log('image with msg: ', pureText)
+
+    const stream = streamObject({
+      model: openai('gpt-4o'),
+      schema: Reply,
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: ANALYSIS_PROMPT
+        },
+        ...fewShots,
+        {
+          role: 'user',
+          content: `以下はチャットの文字起こしです：\n${chatText}\n\n相手の行動を分析し、励ましとアドバイスをください。`
+        }
+      ],
+      async onFinish(res) {
+        // console.log(res.object)
+        const msgs = [
+          ...currentMessages,
+          {
+            role: 'assistant' as 'user' | 'assistant' | 'system' | 'data',
+            content: JSON.stringify(res.object)
+          }
+        ]
+        if (userData.user?.id) {
+          // console.log('chat finished.', userData.user?.id, id, msgs)
+          try {
+            await saveChat(supabase, userData.user?.id, id, msgs)
+          } catch(err) {
+            console.log(err)
+          }
+        }
       }
-    ]
+    });
+
+    return stream.toTextStreamResponse();
+  }
+
+  /* ---------- 6. 普通感情聊天分支 ---------- */
+  const pureText =
+  typeof message.content === 'string'
+    ? message.content
+    : (message.content as any)[0]?.text ?? '';
+  
+  const currentUserMessage = {
+    role: 'user' as 'user' | 'assistant' | 'system' | 'data',
+    content: pureText as string
+  }
+
+  const stream = streamText({
+    model: openai('gpt-4o-mini'),
+    temperature: 0.8,
+    messages: [
+      { role: 'system', content: CHAT_PROMPT },
+      ...(previousMessages ?? []),
+      { role: 'user', content: pureText }
+    ],
+    async onFinish(res) {
+      console.log(res.response.messages[0]?.content)
+      const msgs = [
+        currentUserMessage,
+        ...res.response.messages.map(msg => ({
+          role: msg.role,
+          content: JSON.stringify(msg.content)
+        }))
+      ]
+      if (userData.user?.id) {
+        // console.log('chat finished.', userData.user?.id, id, msgs)
+        try {
+          await saveChat(supabase, userData.user?.id, id, msgs)
+        } catch(err) {
+          console.log(err)
+        }
+      }
+    }
   });
 
-
-  /* 2-6 把 ReadableStream 原样返回，前端边到边渲染 */
-  // return new Response(stream, { headers:{ 'Content-Type':'text/event-stream' }});
-  let full = null;   
-  for await (const chunk of stream.partialObjectStream) {
-    // 每个 chunk 都是 “最新合并后的对象”
-    full = chunk;
-  }
-
-  return NextResponse.json(full);
+  return stream.toTextStreamResponse();
 }

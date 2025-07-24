@@ -1,8 +1,9 @@
 import { createHash } from 'crypto';
 import { createFileSha256 } from './createFileSha256';
 import { supabase } from '@/app/lib/supabase';
+import { BUCKET_NAME } from '../supabase/const';
 
-const bucketName = 'documents';
+
 /* ---------- 主流程 ---------- */
 export async function uploadWithDedup(dataUrl: string) {
   const m = dataUrl.match(/^data:(.+?);base64,(.+)$/);
@@ -19,7 +20,7 @@ export async function uploadWithDedup(dataUrl: string) {
 
   /* 3. 检查同名文件是否已存在 */
   const { data: items, error: listErr } = await supabase
-    .storage.from(bucketName)
+    .storage.from(BUCKET_NAME)
     .list('uploads/', { search: fileName });
 
   if (listErr) throw listErr;
@@ -28,7 +29,7 @@ export async function uploadWithDedup(dataUrl: string) {
     console.log('start to upload')
     /* 4. 上传（upsert:false 防覆盖） */
     const { error: upErr } = await supabase
-      .storage.from(bucketName)
+      .storage.from(BUCKET_NAME)
       .upload(filePath, buffer, { upsert: false });
 
     if (upErr && !upErr.message.includes('exists')) throw upErr;
@@ -36,7 +37,7 @@ export async function uploadWithDedup(dataUrl: string) {
 
   /* 5. 生成 10 秒签名 URL */
   const { data: sig, error: sigErr } = await supabase
-    .storage.from(bucketName)
+    .storage.from(BUCKET_NAME)
     .createSignedUrl(filePath, 10);
 
   if (sigErr || !sig?.signedUrl) throw sigErr ?? new Error('signedUrl missing');

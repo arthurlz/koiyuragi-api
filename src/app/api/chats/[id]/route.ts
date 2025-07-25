@@ -23,7 +23,7 @@ export async function GET(
   if (!userData.user?.id) return new Response('no user', { status: 401 });
 
   const chat = await loadChatByClientId(supabase, userData.user?.id, clientId)
-
+  console.log(chat)
   const messages = await Promise.all(chat?.messages
     // .filter(msg => !(msg.type === 'image'))
     .map(async msg => {

@@ -1,3 +1,4 @@
+// app/api/analyze/route.ts - 更新版本，集成使用限制
 export const runtime = 'nodejs';
 import { NextRequest } from 'next/server';
 import { generateText, Message, streamObject, streamText } from 'ai';
@@ -22,22 +23,18 @@ const hasImageAttachment = (m: Message) =>
 
 /* 检查消息是否有有效内容 */
 const hasValidContent = (message: Message): boolean => {
-  // 检查文本内容
   let textContent = '';
   if (typeof message.content === 'string') {
     textContent = message.content.trim();
   } else if (Array.isArray(message.content)) {
-    textContent = (message.content as any)
+    textContent = message.content
       .filter(item => item.type === 'text')
       .map(item => item.text)
       .join('')
       .trim();
   }
   
-  // 检查附件
   const hasAttachment = hasImageAttachment(message);
-  
-  // 有文本内容或有附件才算有效
   return textContent.length > 0 || hasAttachment;
 };
 
@@ -59,48 +56,25 @@ const extractTextContent = (message: Message): string => {
 const shouldAnalyze = (message: Message): boolean => {
   const content = extractTextContent(message);
   
-  // 1. 有图片附件 - 通常是聊天截图需要分析
-  if (hasImageAttachment(message)) {
-    return true;
-  }
+  if (hasImageAttachment(message)) return true;
+  if (content.startsWith('#分析') || content.startsWith('#analyze')) return true;
+  if (content.length > 150) return true;
   
-  // 2. 明确的分析指令
-  if (content.startsWith('#分析') || content.startsWith('#analyze')) {
-    return true;
-  }
-  
-  // 3. 内容长度判断 - 长文本可能需要深度分析
-  if (content.length > 150) {
-    return true;
-  }
-  
-  // 4. 关键词检测 - 用户明确寻求建议
   const adviceKeywords = [
     'どうしたら', 'どうすれば', 'アドバイス', '助けて',
     'つらい', '悩んで', '困って', '不安',
     'どう思う', 'どうしよう', '教えて'
   ];
   
-  if (adviceKeywords.some(keyword => content.includes(keyword))) {
-    return true;
-  }
+  if (adviceKeywords.some(keyword => content.includes(keyword))) return true;
+  if (content.match(/[？?]/)) return true;
   
-  // 5. 问句检测 - 包含问号通常需要分析
-  if (content.match(/[？?]/)) {
-    return true;
-  }
-  
-  // 6. 情绪词检测 - 负面情绪可能需要深度支持
   const emotionKeywords = [
     '悲しい', '寂しい', '辛い', '苦しい',
     '怖い', '不安', 'ストレス', '疲れ'
   ];
   
-  if (emotionKeywords.some(keyword => content.includes(keyword))) {
-    return true;
-  }
-  
-  // 默认使用轻松聊天模式
+  if (emotionKeywords.some(keyword => content.includes(keyword))) return true;
   return false;
 };
 
@@ -112,18 +86,13 @@ const createMessagesToSave = (
 ): Array<{ role: 'user' | 'assistant' | 'system' | 'data', content: any }> => {
   const messages: Array<{ role: 'user' | 'assistant' | 'system' | 'data', content: any }> = [];
   
-  // 只有当有图片路径时才保存图片消息（用于记录，但不用于对话）
   if (imagePath) {
     messages.push({
       role: 'user',
-      content: {
-        type: 'image',
-        text: imagePath
-      }
+      content: { type: 'image', text: imagePath }
     });
   }
   
-  // 只有当有文本内容时才保存文本消息
   if (textContent.trim()) {
     messages.push({
       role: 'user',
@@ -131,7 +100,6 @@ const createMessagesToSave = (
     });
   }
   
-  // 总是保存AI回复（如果有）
   if (assistantResponse) {
     messages.push({
       role: 'assistant',
@@ -166,6 +134,41 @@ export async function POST(req: NextRequest) {
     return new Response('empty message', { status: 400 });
   }
 
+  // 🔥 新增：检查使用限制
+  try {
+    const { data: limitData, error: limitError } = await supabase.rpc('check_usage_limit', {
+      user_uuid: userData.user.id,
+      limit_type: 'ai_messages',
+      increment_count: 0
+    });
+
+    if (limitError) {
+      console.error('Error checking usage limit:', limitError);
+      return new Response('Failed to check usage limit', { status: 500 });
+    }
+
+    const limitCheck = limitData?.[0];
+    if (!limitCheck?.allowed) {
+      // 返回限制错误信息
+      return new Response(JSON.stringify({
+        error: 'USAGE_LIMIT_EXCEEDED',
+        message: limitCheck.is_premium 
+          ? 'プレミアムプランでも1日の上限に達しました' 
+          : '無料プランでは1日1回までAIとの会話が可能です。プレミアムプランにアップグレードして無制限にご利用ください。',
+        current_usage: limitCheck.current_usage,
+        daily_limit: limitCheck.daily_limit,
+        remaining: limitCheck.remaining,
+        is_premium: limitCheck.is_premium
+      }), { 
+        status: 429,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  } catch (error) {
+    console.error('Usage limit check error:', error);
+    return new Response('Internal server error', { status: 500 });
+  }
+
   // 获取历史消息并过滤格式
   let previousMessages: Array<{
     role: 'user' | 'assistant' | 'system',
@@ -177,7 +180,6 @@ export async function POST(req: NextRequest) {
     if (previousChat?.messages) {
       previousMessages = previousChat.messages
         .filter(msg => {
-          // 过滤掉图片消息和空消息
           if (msg.role === 'user') {
             if (typeof msg.content === 'object' && msg.content.type === 'image') {
               return false;
@@ -198,7 +200,6 @@ export async function POST(req: NextRequest) {
                   content: parsedContent?.[0].text || ''
                 };
               } else if (getType(parsedContent) === 'Object') {
-                // 如果是分析结果，转换为友好的文本
                 if (parsedContent.empathy) {
                   return {
                     role: msg.role as 'assistant',
@@ -211,7 +212,6 @@ export async function POST(req: NextRequest) {
                 };
               }
             } catch (e) {
-              // 如果不是 JSON，直接使用原内容
               return {
                 role: msg.role as 'assistant',
                 content: msg.content
@@ -219,13 +219,12 @@ export async function POST(req: NextRequest) {
             }
           }
           
-          // 用户消息
           return {
             role: msg.role as 'user',
             content: typeof msg.content === 'string' ? msg.content : ''
           };
         })
-        .filter(msg => msg.content.trim()) // 过滤掉空内容
+        .filter(msg => msg.content.trim());
     }
     console.log('filtered previousMessages: ', previousMessages);
   } catch(err) {
@@ -277,7 +276,6 @@ export async function POST(req: NextRequest) {
       chatText = textContent.replace(/^#(分析|analyze)\s*/i, '');
     }
 
-    // 确保有内容可分析
     const analysisContent = chatText || textContent;
     if (!analysisContent.trim()) {
       console.log('No content to analyze');
@@ -304,14 +302,12 @@ export async function POST(req: NextRequest) {
         }
       ],
       async onFinish(res) {
-        // 只保存有效的消息
         const messagesToSave = createMessagesToSave(
           textContent,
           imagePath,
           JSON.stringify(res.object)
         );
         
-        // 如果没有有效消息要保存，就不保存
         if (messagesToSave.length === 0) {
           console.log('No valid messages to save');
           return;
@@ -319,10 +315,19 @@ export async function POST(req: NextRequest) {
         
         if (userData.user?.id) {
           try {
+            // 保存对话
             await saveChat(supabase, userData.user?.id, id, messagesToSave);
             console.log('Saved analysis messages:', messagesToSave.length);
+            
+            // 🔥 记录使用量
+            await supabase.rpc('record_usage', {
+              user_uuid: userData.user.id,
+              usage_type: 'ai_messages',
+              count_increment: 1
+            });
+            console.log('Recorded AI message usage');
           } catch(err) {
-            console.log('Error saving chat:', err);
+            console.log('Error saving chat or recording usage:', err);
           }
         }
       }
@@ -334,7 +339,6 @@ export async function POST(req: NextRequest) {
   /* ---------- 普通感情聊天分支 ---------- */
   const textContent = extractTextContent(message);
   
-  // 再次检查文本内容是否为空
   if (!textContent.trim()) {
     console.log('Empty text message in chat mode');
     return new Response('empty text message', { status: 400 });
@@ -353,10 +357,9 @@ export async function POST(req: NextRequest) {
     async onFinish(res) {
       console.log(res.response.messages[0]?.content);
       
-      // 只保存有文本内容的消息
       const messagesToSave = createMessagesToSave(
         textContent,
-        '', // 聊天模式不保存图片
+        '',
         JSON.stringify(res.response.messages.map(msg => msg.content))
       );
       
@@ -367,10 +370,19 @@ export async function POST(req: NextRequest) {
       
       if (userData.user?.id) {
         try {
+          // 保存对话
           await saveChat(supabase, userData.user?.id, id, messagesToSave);
           console.log('Saved chat messages:', messagesToSave.length);
+          
+          // 🔥 记录使用量
+          await supabase.rpc('record_usage', {
+            user_uuid: userData.user.id,
+            usage_type: 'ai_messages',
+            count_increment: 1
+          });
+          console.log('Recorded AI message usage');
         } catch(err) {
-          console.log('Error saving chat:', err);
+          console.log('Error saving chat or recording usage:', err);
         }
       }
     }
